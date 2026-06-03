@@ -44,16 +44,16 @@ export function checkWhisperAvailability(): string | null {
     // 3. Check model file
     const modelsDir = path.join(
         path.dirname(require.resolve('nodejs-whisper/package.json')),
-        'models',
+        'cpp', 'whisper.cpp', 'models',
     );
     try {
         const files = require('fs').readdirSync(modelsDir) as string[];
-        if (!files.some((f: string) => f.includes('base.en'))) throw new Error();
+        if (!files.some((f: string) => f.includes('large-v3-turbo'))) throw new Error();
     } catch {
         return (
             '🔇 Whisper model not downloaded.\n\n' +
-            'Run this once to fetch the base.en model (~140 MB):\n' +
-            '  npx nodejs-whisper download'
+            'Run this once to fetch the large-v3-turbo model (~1.5 GB):\n' +
+            '  npx nodejs-whisper download large-v3-turbo'
         );
     }
 
@@ -126,10 +126,11 @@ export async function transcribeVoice(voicePath: string): Promise<string | null>
         const { nodewhisper } = require('nodejs-whisper') as typeof import('nodejs-whisper');
 
         const result = await nodewhisper(voicePath, {
-            modelName: 'base.en',
-            autoDownloadModelName: 'base.en',
+            modelName: 'large-v3-turbo',
+            autoDownloadModelName: 'large-v3-turbo',
             removeWavFileAfterTranscription: true,
             whisperOptions: {
+                language: 'auto',
                 outputInText: true,
                 outputInSrt: false,
                 outputInVtt: false,

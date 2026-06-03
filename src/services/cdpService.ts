@@ -1545,13 +1545,31 @@ export class CdpService extends EventEmitter {
             throw new Error('Not connected to CDP.');
         }
 
-        // Antigravity 1.21.6+ uses <button> elements; older versions use <div>.
-        // Use tag-agnostic class-based selector to support both.
         const expression = `(async () => {
-            return Array.from(document.querySelectorAll('button, div'))
-                .filter(e => e.className.includes('px-2 py-1') && e.className.includes('w-full') && e.className.includes('items-center') && e.className.includes('justify-between'))
-                .map(e => (e.textContent || '').trim().replace(/New$/, '').trim())
-                .filter(t => t.length > 0 && t.length < 60);
+            try {
+                if (!document.querySelector('.antigravity-agent-side-panel')) {
+                    const toggleBtn = document.querySelector('.open-agent-manager-button');
+                    if (toggleBtn) toggleBtn.click();
+                }
+                await new Promise(r => setTimeout(r, 500));
+                
+                const headings = Array.from(document.querySelectorAll('.antigravity-agent-side-panel div.opacity-80'));
+                const modelHeading = headings.find(el => el.textContent && el.textContent.trim() === 'Model');
+                if (!modelHeading) return JSON.stringify({ models: [] });
+                
+                const listContainer = modelHeading.nextElementSibling;
+                if (!listContainer) return JSON.stringify({ models: [] });
+                
+                const items = listContainer.querySelectorAll('div.cursor-pointer');
+                const models = Array.from(items).map(item => {
+                    const span = item.querySelector('.text-xs.font-medium');
+                    return span ? span.textContent.trim() : '';
+                }).filter(Boolean);
+                
+                return JSON.stringify({ models });
+            } catch (e) {
+                return JSON.stringify({ models: [] });
+            }
         })()`;
 
         try {
@@ -1564,10 +1582,11 @@ export class CdpService extends EventEmitter {
             if (contextId !== null) callParams.contextId = contextId;
 
             const res = await this.call('Runtime.evaluate', callParams);
-            const value = res?.result?.value;
-            if (Array.isArray(value) && value.length > 0) {
-                // remove duplicates
-                return Array.from(new Set(value));
+            if (typeof res?.result?.value === 'string') {
+                const parsed = JSON.parse(res.result.value);
+                if (parsed.models && parsed.models.length > 0) {
+                    return Array.from(new Set(parsed.models)) as string[];
+                }
             }
             return [];
         } catch (error: any) {
@@ -1583,11 +1602,20 @@ export class CdpService extends EventEmitter {
         if (!this.isConnectedFlag || !this.ws) {
             return null;
         }
-        // Antigravity 1.21.6+ uses <button> elements; older versions use <div>.
         const expression = `(() => {
-            var selected = Array.from(document.querySelectorAll('button, div'))
-                .find(e => e.className.includes('px-2 py-1') && e.className.includes('w-full') && e.className.includes('items-center') && e.className.includes('justify-between') && e.className.includes('bg-gray-500/20') && !e.className.includes('hover:bg-gray-500/20'));
-            return selected ? (selected.textContent || '').trim().replace(/New$/, '').trim() : null;
+            try {
+                // Check the trigger button label inside the panel (always shows current model)
+                const headings = Array.from(document.querySelectorAll('.antigravity-agent-side-panel div.opacity-80'));
+                const modelHeading = headings.find(el => el.textContent && el.textContent.trim() === 'Model');
+                if (modelHeading) {
+                    const dialog = modelHeading.closest('div[role="dialog"]');
+                    if (dialog && dialog.previousElementSibling) {
+                        const lbl = dialog.previousElementSibling.querySelector('span.opacity-70');
+                        if (lbl) return lbl.textContent.trim();
+                    }
+                }
+            } catch(e) {}
+            return null;
         })()`;
         try {
             const contextId = this.getPrimaryContextId();
@@ -1603,7 +1631,6 @@ export class CdpService extends EventEmitter {
 
     /**
      * Operate Antigravity UI model dropdown to switch to the specified model.
-     * (Step 9: Model/mode switching UI sync)
      *
      * @param modelName Model name to set (e.g., 'gpt-4o', 'claude-3-opus')
      */
@@ -1612,55 +1639,46 @@ export class CdpService extends EventEmitter {
             throw new Error('Not connected to CDP. Call connect() first.');
         }
 
-        // Antigravity 1.21.6+ uses <button> elements; older versions use <div>.
-        // Tag-agnostic class-based selector supports both versions.
-        // textContent may have "New" suffix on newly added models.
         const safeModel = JSON.stringify(modelName);
         const expression = `(async () => {
-            const targetModel = ${safeModel};
+            try {
+                if (!document.querySelector('.antigravity-agent-side-panel')) {
+                    const toggleBtn = document.querySelector('.open-agent-manager-button');
+                    if (toggleBtn) toggleBtn.click();
+                    await new Promise(r => setTimeout(r, 500));
+                }
 
-            // Get all items in the model list (button in 1.21.6+, div in older)
-            const modelItems = Array.from(document.querySelectorAll('button, div'))
-                .filter(e => e.className.includes('px-2 py-1') && e.className.includes('w-full') && e.className.includes('items-center') && e.className.includes('justify-between'));
+                const targetModel = ${safeModel};
+                const headings = Array.from(document.querySelectorAll('.antigravity-agent-side-panel div.opacity-80'));
+                const modelHeading = headings.find(el => el.textContent && el.textContent.trim() === 'Model');
+                if (!modelHeading) return { ok: false, error: 'Model container not found in side panel' };
+                
+                const listContainer = modelHeading.nextElementSibling;
+                if (!listContainer) return { ok: false, error: 'Model list not found in side panel' };
 
-            if (modelItems.length === 0) {
-                return { ok: false, error: 'Model list not found. The dropdown may not be open.' };
-            }
+                const items = Array.from(listContainer.querySelectorAll('div.cursor-pointer'));
+                const targetItem = items.find(item => {
+                    const span = item.querySelector('.text-xs.font-medium');
+                    const text = span ? span.textContent.trim() : item.textContent.trim();
+                    return text === targetModel || text.toLowerCase() === targetModel.toLowerCase();
+                });
 
-            // Match target model by name (compare after removing New suffix)
-            const targetItem = modelItems.find(el => {
-                const text = (el.textContent || '').trim().replace(/New$/, '').trim();
-                return text === targetModel || text.toLowerCase() === targetModel.toLowerCase();
-            });
+                if (!targetItem) {
+                    return { ok: false, error: 'Target model ' + targetModel + ' not found in the list.' };
+                }
 
-            if (!targetItem) {
-                const available = modelItems.map(el => (el.textContent || '').trim().replace(/New$/, '').trim()).join(', ');
-                return { ok: false, error: 'Model "' + targetModel + '" not found. Available: ' + available };
-            }
+                if (targetItem.className.includes('bg-gray-500/20')) {
+                    return { ok: true, model: targetModel, alreadySelected: true };
+                }
 
-            // Check if already selected
-            if (targetItem.className.includes('bg-gray-500/20') && !targetItem.className.includes('hover:bg-gray-500/20')) {
-                return { ok: true, model: targetModel, alreadySelected: true };
-            }
-
-            // Click to select model
-            targetItem.click();
-            await new Promise(r => setTimeout(r, 500));
-
-            // Verify selection was applied
-            const updatedItems = Array.from(document.querySelectorAll('button, div'))
-                .filter(e => e.className.includes('px-2 py-1') && e.className.includes('w-full') && e.className.includes('items-center') && e.className.includes('justify-between'));
-            const selectedItem = updatedItems.find(el => {
-                const text = (el.textContent || '').trim().replace(/New$/, '').trim();
-                return text === targetModel || text.toLowerCase() === targetModel.toLowerCase();
-            });
-
-            if (selectedItem && selectedItem.className.includes('bg-gray-500/20') && !selectedItem.className.includes('hover:bg-gray-500/20')) {
+                // Click the target item directly (React onClick handles hidden elements)
+                targetItem.click();
+                
+                await new Promise(r => setTimeout(r, 300));
                 return { ok: true, model: targetModel, verified: true };
+            } catch (e) {
+                return { ok: false, error: String(e) };
             }
-
-            // Click succeeded but verification failed
-            return { ok: true, model: targetModel, verified: false };
         })()`;
 
         try {

@@ -15,7 +15,7 @@ import { htmlToTelegramHtml } from '../utils/htmlToTelegramMarkdown';
 // ---------------------------------------------------------------------------
 
 export interface AssistantDomSegment {
-    kind: 'assistant-body' | 'thinking' | 'thinking-content' | 'tool-call' | 'tool-result' | 'feedback';
+    kind: 'assistant-body' | 'notify-body' | 'thinking' | 'thinking-content' | 'tool-call' | 'tool-result' | 'feedback';
     text: string;
     role: 'assistant';
     messageIndex: number;
@@ -83,6 +83,12 @@ export function classifyAssistantSegments(payload: unknown): ClassifyResult {
                 // Subsequent segments are artifact card tool-call outputs that leaked into
                 // the DOM and must not be appended to the Telegram message.
                 if (bodyTexts.length === 0 && seg.text && seg.text.trim()) {
+                    bodyTexts.push(seg.text);
+                }
+                break;
+            case 'notify-body':
+                // Notify user containers contain direct messages to the user and MUST be shown.
+                if (seg.text && seg.text.trim()) {
                     bodyTexts.push(seg.text);
                 }
                 break;
@@ -323,6 +329,7 @@ export function extractAssistantSegmentsPayloadScript(): string {
 
     for (var ci = 0; ci < artifactCards.length; ci++) {
         var card = artifactCards[ci];
+        var isNotifyCard = card.classList && card.classList.contains('notify-user-container');
         var mdNodes = Array.from(card.querySelectorAll('.rendered-markdown, .markdown-body, .prose'));
         if (mdNodes.length === 0) {
             mdNodes = [card];
@@ -383,11 +390,11 @@ export function extractAssistantSegmentsPayloadScript(): string {
                     artifactHtml = '<div>' + artifactHtml + '</div>';
                 }
                 segments.push({
-                    kind: 'assistant-body',
+                    kind: isNotifyCard ? 'notify-body' : 'assistant-body',
                     text: artifactHtml,
                     role: 'assistant',
                     messageIndex: 0,
-                    domPath: 'artifact-card'
+                    domPath: isNotifyCard ? 'notify-card' : 'artifact-card'
                 });
                 bodyFound = true;
             }
