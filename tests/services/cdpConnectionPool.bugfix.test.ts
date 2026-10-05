@@ -88,6 +88,39 @@ describe('CdpConnectionPool — bug fix coverage', () => {
         });
     });
 
+    describe('workspace path isolation', () => {
+        it('keeps separate CDP connections for different full paths with the same basename', async () => {
+            const firstCdp = {
+                isConnected: jest.fn().mockReturnValue(true),
+                discoverAndConnectForWorkspace: jest.fn().mockResolvedValue(true),
+                on: jest.fn(),
+                disconnect: jest.fn().mockResolvedValue(undefined),
+            };
+            const secondCdp = {
+                isConnected: jest.fn().mockReturnValue(true),
+                discoverAndConnectForWorkspace: jest.fn().mockResolvedValue(true),
+                on: jest.fn(),
+                disconnect: jest.fn().mockResolvedValue(undefined),
+            };
+
+            let callCount = 0;
+            (CdpService as jest.MockedClass<typeof CdpService>).mockImplementation(() => {
+                callCount++;
+                return (callCount === 1 ? firstCdp : secondCdp) as any;
+            });
+
+            const a = await pool.getOrConnect('/clients/acme/app');
+            const b = await pool.getOrConnect('/clients/other/app');
+
+            expect(a).toBe(firstCdp);
+            expect(b).toBe(secondCdp);
+            expect(a).not.toBe(b);
+            expect(firstCdp.discoverAndConnectForWorkspace).toHaveBeenCalledWith('/clients/acme/app');
+            expect(secondCdp.discoverAndConnectForWorkspace).toHaveBeenCalledWith('/clients/other/app');
+            expect(pool.getConnected('app')).toBeNull();
+        });
+    });
+
     describe('reconnectFailed uses disconnectWorkspace', () => {
         it('removes connection and stops detectors on reconnectFailed', async () => {
             const eventHandlers: Record<string, Function> = {};

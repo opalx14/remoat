@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import * as path from 'path';
 
 import { logger } from '../utils/logger';
 import { extractProjectNameFromPath } from '../utils/pathUtils';
@@ -21,7 +22,10 @@ import { UserMessageDetector } from './userMessageDetector';
  * - `workspace:reconnectFailed` (projectName: string)
  */
 export class CdpConnectionPool extends EventEmitter {
+    /** CDP connections keyed by normalized full workspace path. */
     private readonly connections = new Map<string, CdpService>();
+    /** Human-readable project name for each full-path connection key. */
+    private readonly connectionProjectNames = new Map<string, string>();
     private readonly approvalDetectors = new Map<string, ApprovalDetector>();
     private readonly errorPopupDetectors = new Map<string, ErrorPopupDetector>();
     private readonly planningDetectors = new Map<string, PlanningDetector>();
@@ -44,9 +48,11 @@ export class CdpConnectionPool extends EventEmitter {
      */
     async getOrConnect(workspacePath: string): Promise<CdpService> {
         const projectName = this.extractProjectName(workspacePath);
+        const connectionKey = this.getConnectionKey(workspacePath);
 
-        // Return existing connection if available
-        const existing = this.connections.get(projectName);
+        // Return an existing connection only for this exact workspace path.
+        // Basenames are not unique: /client-a/app and /client-b/app are different workspaces.
+        const existing = this.connections.get(connectionKey);
         if (existing) {
             if (existing.isConnected()) {
                 try {
@@ -54,31 +60,31 @@ export class CdpConnectionPool extends EventEmitter {
                     await existing.discoverAndConnectForWorkspace(workspacePath);
                     return existing;
                 } catch {
-                    // Connection dropped during re-validation; close WebSocket and clean up
+                    // Connection dropped during re-validation; close WebSocket and clean up.
                     existing.disconnect().catch(() => {});
-                    this.connections.delete(projectName);
+                    this.connections.delete(connectionKey);
+                    this.connectionProjectNames.delete(connectionKey);
                 }
             } else {
-                // Stale disconnected entry (e.g. reconnect was disabled) — clean up
-                this.connections.delete(projectName);
+                // Stale disconnected entry (e.g. reconnect was disabled) — clean up.
+                this.connections.delete(connectionKey);
+                this.connectionProjectNames.delete(connectionKey);
             }
         }
 
-        // Wait for the pending connection promise if one exists (prevents concurrent connections)
-        const pending = this.connectingPromises.get(projectName);
+        // Wait for a pending connection to this exact workspace path.
+        const pending = this.connectingPromises.get(connectionKey);
         if (pending) {
             return pending;
         }
 
-        // Start a new connection
-        const connectPromise = this.createAndConnect(workspacePath, projectName);
-        this.connectingPromises.set(projectName, connectPromise);
+        const connectPromise = this.createAndConnect(workspacePath, projectName, connectionKey);
+        this.connectingPromises.set(connectionKey, connectPromise);
 
         try {
-            const cdp = await connectPromise;
-            return cdp;
+            return await connectPromise;
         } finally {
-            this.connectingPromises.delete(projectName);
+            this.connectingPromises.delete(connectionKey);
         }
     }
 
@@ -87,9 +93,18 @@ export class CdpConnectionPool extends EventEmitter {
      * Returns null if not connected.
      */
     getConnected(projectName: string): CdpService | null {
-        const cdp = this.connections.get(projectName);
-        if (cdp && cdp.isConnected()) {
-            return cdp;
+        const matches = [...this.connections.entries()].filter(([key, cdp]) =>
+            this.connectionProjectNames.get(key) === projectName && cdp.isConnected(),
+        );
+
+        if (matches.length === 1) {
+            return matches[0][1];
+        }
+
+        if (matches.length > 1) {
+            logger.warn(
+                `[CdpConnectionPool] Ambiguous project name "${projectName}" maps to ${matches.length} workspace paths; refusing implicit selection.`,
+            );
         }
         return null;
     }
@@ -98,12 +113,19 @@ export class CdpConnectionPool extends EventEmitter {
      * Disconnect the specified workspace.
      */
     disconnectWorkspace(projectName: string): void {
-        const cdp = this.connections.get(projectName);
-        if (cdp) {
-            cdp.disconnect().catch((err) => {
-                logger.error(`[CdpConnectionPool] Error while disconnecting ${projectName}:`, err);
-            });
-            this.connections.delete(projectName);
+        const matchingKeys = [...this.connections.keys()].filter(
+            (key) => this.connectionProjectNames.get(key) === projectName,
+        );
+
+        for (const key of matchingKeys) {
+            const cdp = this.connections.get(key);
+            if (cdp) {
+                cdp.disconnect().catch((err) => {
+                    logger.error(`[CdpConnectionPool] Error while disconnecting ${projectName}:`, err);
+                });
+            }
+            this.connections.delete(key);
+            this.connectionProjectNames.delete(key);
         }
 
         const detector = this.approvalDetectors.get(projectName);
@@ -135,8 +157,11 @@ export class CdpConnectionPool extends EventEmitter {
      * Completely close the Antigravity instance for the specified workspace via CDP.
      */
     async closeBrowserWorkspace(projectName: string): Promise<void> {
-        const cdp = this.connections.get(projectName);
-        if (cdp) {
+        const matchingCdps = [...this.connections.entries()]
+            .filter(([key]) => this.connectionProjectNames.get(key) === projectName)
+            .map(([, cdp]) => cdp);
+
+        for (const cdp of matchingCdps) {
             try {
                 await cdp.closeBrowserTarget();
             } catch (err) {
@@ -150,8 +175,16 @@ export class CdpConnectionPool extends EventEmitter {
      * Disconnect all workspace connections.
      */
     disconnectAll(): void {
-        for (const projectName of [...this.connections.keys()]) {
-            this.disconnectWorkspace(projectName);
+        for (const [key, cdp] of [...this.connections.entries()]) {
+            cdp.disconnect().catch((err) => {
+                logger.error(`[CdpConnectionPool] Error while disconnecting ${key}:`, err);
+            });
+        }
+        this.connections.clear();
+        this.connectionProjectNames.clear();
+
+        for (const projectName of [...this.approvalDetectors.keys()]) {
+            this.disconnectDetectors(projectName);
         }
     }
 
@@ -234,13 +267,14 @@ export class CdpConnectionPool extends EventEmitter {
      * Return a list of workspace names with active connections.
      */
     getActiveWorkspaceNames(): string[] {
-        const active: string[] = [];
-        for (const [name, cdp] of this.connections) {
+        const active = new Set<string>();
+        for (const [key, cdp] of this.connections) {
             if (cdp.isConnected()) {
-                active.push(name);
+                const projectName = this.connectionProjectNames.get(key);
+                if (projectName) active.add(projectName);
             }
         }
-        return active;
+        return [...active];
     }
 
     /**
@@ -253,12 +287,17 @@ export class CdpConnectionPool extends EventEmitter {
     /**
      * Create a new CdpService and connect to the workspace.
      */
-    private async createAndConnect(workspacePath: string, projectName: string): Promise<CdpService> {
-        // Disconnect old connection if exists
-        const old = this.connections.get(projectName);
+    private async createAndConnect(
+        workspacePath: string,
+        projectName: string,
+        connectionKey: string,
+    ): Promise<CdpService> {
+        // Disconnect an old connection only for this exact workspace path.
+        const old = this.connections.get(connectionKey);
         if (old) {
             await old.disconnect().catch(() => {});
-            this.connections.delete(projectName);
+            this.connections.delete(connectionKey);
+            this.connectionProjectNames.delete(connectionKey);
         }
 
         const cdp = new CdpService(this.cdpOptions);
@@ -277,15 +316,59 @@ export class CdpConnectionPool extends EventEmitter {
         });
 
         cdp.on('reconnectFailed', () => {
-            logger.error(`[CdpConnectionPool] Reconnection failed for workspace "${projectName}". Removing from pool`);
+            logger.error(`[CdpConnectionPool] Reconnection failed for workspace "${projectName}". Removing exact path from pool`);
             this.emit('workspace:reconnectFailed', projectName);
-            this.disconnectWorkspace(projectName);
+            this.disconnectConnectionKey(connectionKey);
+            this.disconnectDetectors(projectName);
         });
 
-        // Connect to the workspace
+        // Connect to the workspace.
         await cdp.discoverAndConnectForWorkspace(workspacePath);
-        this.connections.set(projectName, cdp);
+        this.connections.set(connectionKey, cdp);
+        this.connectionProjectNames.set(connectionKey, projectName);
 
         return cdp;
+    }
+
+    private getConnectionKey(workspacePath: string): string {
+        return path.resolve(workspacePath);
+    }
+
+    private disconnectConnectionKey(connectionKey: string): void {
+        const cdp = this.connections.get(connectionKey);
+        const projectName = this.connectionProjectNames.get(connectionKey) || connectionKey;
+        if (cdp) {
+            cdp.disconnect().catch((err) => {
+                logger.error(`[CdpConnectionPool] Error while disconnecting ${projectName}:`, err);
+            });
+        }
+        this.connections.delete(connectionKey);
+        this.connectionProjectNames.delete(connectionKey);
+    }
+
+    private disconnectDetectors(projectName: string): void {
+        const detector = this.approvalDetectors.get(projectName);
+        if (detector) {
+            detector.stop();
+            this.approvalDetectors.delete(projectName);
+        }
+
+        const errorPopupDetector = this.errorPopupDetectors.get(projectName);
+        if (errorPopupDetector) {
+            errorPopupDetector.stop();
+            this.errorPopupDetectors.delete(projectName);
+        }
+
+        const planningDetector = this.planningDetectors.get(projectName);
+        if (planningDetector) {
+            planningDetector.stop();
+            this.planningDetectors.delete(projectName);
+        }
+
+        const userMsgDetector = this.userMessageDetectors.get(projectName);
+        if (userMsgDetector) {
+            userMsgDetector.stop();
+            this.userMessageDetectors.delete(projectName);
+        }
     }
 }

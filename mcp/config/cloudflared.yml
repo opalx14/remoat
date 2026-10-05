@@ -1,0 +1,7 @@
+tunnel: 705cb9c5-7411-4536-b203-9cf2cc35164a
+credentials-file: /Users/opalx14/.cloudflared/705cb9c5-7411-4536-b203-9cf2cc35164a.json
+
+ingress:
+  - hostname: remoat.promptmarketcap.net
+    service: http://127.0.0.1:7680
+  - service: http_status:404

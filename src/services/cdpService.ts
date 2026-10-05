@@ -563,15 +563,31 @@ export class CdpService extends EventEmitter {
             logger.debug(`  - title="${p.title}" url=${p.url}`);
         }
 
-        // 1. Title match (fast path)
-        const titleMatch = workbenchPages.find((t: any) => t.title?.includes(projectName));
-        if (titleMatch) {
-            return this.connectToPage(titleMatch, projectName);
+        // 1. Title match (fast path), but only when the match is unambiguous.
+        // Never pick the first substring match: projects like "app" and "app-old"
+        // or two different folders both named "app" must not share a target.
+        const titleMatches = workbenchPages.filter((t: any) =>
+            this.titleMatchesProject(String(t.title || ''), projectName),
+        );
+        if (titleMatches.length === 1) {
+            return this.connectToPage(titleMatches[0], projectName);
         }
 
-        // 2. Title match failed -> CDP probe (connect to each page and check document.title)
-        logger.debug(`[CdpService] Title match failed. Searching via CDP probe...`);
-        const probeResult = await this.probeWorkbenchPages(workbenchPages, projectName, workspacePath);
+        const requirePathMatch = titleMatches.length > 1;
+        if (requirePathMatch) {
+            logger.warn(
+                `[CdpService] Ambiguous title match for workspace "${projectName}" (${titleMatches.length} pages). Requiring full-path verification.`,
+            );
+        }
+
+        // 2. Title match failed or ambiguous -> CDP probe.
+        logger.debug(`[CdpService] Searching via CDP probe...`);
+        const probeResult = await this.probeWorkbenchPages(
+            workbenchPages,
+            projectName,
+            workspacePath,
+            requirePathMatch,
+        );
         if (probeResult) {
             return true;
         }
@@ -613,6 +629,7 @@ export class CdpService extends EventEmitter {
         workbenchPages: any[],
         projectName: string,
         workspacePath?: string,
+        requirePathMatch: boolean = false,
     ): Promise<boolean> {
         for (const page of workbenchPages) {
             try {
@@ -629,15 +646,19 @@ export class CdpService extends EventEmitter {
                 const normalizedLiveTitle = liveTitle.toLowerCase();
                 const normalizedProject = projectName.toLowerCase();
 
-                if (normalizedLiveTitle.includes(normalizedProject)) {
+                if (this.titleMatchesProject(liveTitle, projectName) && !requirePathMatch) {
                     this.currentWorkspaceName = projectName;
                     logger.debug(`[CdpService] Probe success: detected "${projectName}"`);
                     return true;
                 }
 
-                // If title is "Untitled (Workspace)", verify by folder path
-                if (normalizedLiveTitle.includes('untitled') && workspacePath) {
-                    const folderMatch = await this.probeWorkspaceFolderPath(projectName, workspacePath);
+                // When names are ambiguous, or the page is untitled, require a folder-path probe.
+                if (workspacePath && (requirePathMatch || normalizedLiveTitle.includes('untitled'))) {
+                    const folderMatch = await this.probeWorkspaceFolderPath(
+                        projectName,
+                        workspacePath,
+                        requirePathMatch,
+                    );
                     if (folderMatch) {
                         return true;
                     }
@@ -664,6 +685,7 @@ export class CdpService extends EventEmitter {
     private async probeWorkspaceFolderPath(
         projectName: string,
         workspacePath: string,
+        requireFullPath: boolean = false,
     ): Promise<boolean> {
         try {
             // Instead of DOM/document.title, check folder parameter in page URL or
@@ -706,10 +728,9 @@ export class CdpService extends EventEmitter {
                 const normalizedProject = projectName.toLowerCase();
                 const normalizedWorkspace = workspacePath.toLowerCase();
 
-                if (
-                    normalizedDetected.includes(normalizedProject) ||
-                    normalizedDetected.includes(normalizedWorkspace)
-                ) {
+                const fullPathMatched = normalizedDetected.includes(normalizedWorkspace);
+                const projectNameMatched = normalizedDetected.includes(normalizedProject);
+                if (fullPathMatched || (!requireFullPath && projectNameMatched)) {
                     this.currentWorkspaceName = projectName;
                     logger.debug(`[CdpService] Folder path match success: "${projectName}"`);
                     return true;
@@ -723,7 +744,9 @@ export class CdpService extends EventEmitter {
             });
             const pageUrl = (urlResult?.result?.value || '').toLowerCase();
             const normalizedWorkspaceUri = encodeURIComponent(workspacePath).toLowerCase();
-            if (pageUrl.includes(normalizedWorkspaceUri) || pageUrl.includes(projectName.toLowerCase())) {
+            const fullPathMatched = pageUrl.includes(normalizedWorkspaceUri);
+            const projectNameMatched = pageUrl.includes(projectName.toLowerCase());
+            if (fullPathMatched || (!requireFullPath && projectNameMatched)) {
                 this.currentWorkspaceName = projectName;
                 logger.debug(`[CdpService] URL parameter match success: "${projectName}"`);
                 return true;
@@ -817,14 +840,22 @@ export class CdpService extends EventEmitter {
                     t.url?.includes('workbench'),
             );
 
-            // Title match
-            const titleMatch = workbenchPages.find((t: any) => t.title?.toLowerCase().includes(projectName.toLowerCase()));
-            if (titleMatch) {
-                return this.connectToPage(titleMatch, projectName);
+            // Title match only when unambiguous.
+            const titleMatches = workbenchPages.filter((t: any) =>
+                this.titleMatchesProject(String(t.title || ''), projectName),
+            );
+            if (titleMatches.length === 1) {
+                return this.connectToPage(titleMatches[0], projectName);
             }
 
-            // CDP probe (also check folder path if title is not updated)
-            const probeResult = await this.probeWorkbenchPages(workbenchPages, projectName, workspacePath);
+            // CDP probe. If more than one page has the same project title,
+            // basename matching is unsafe and full-path verification is required.
+            const probeResult = await this.probeWorkbenchPages(
+                workbenchPages,
+                projectName,
+                workspacePath,
+                titleMatches.length > 1,
+            );
             if (probeResult) {
                 return true;
             }
@@ -847,6 +878,16 @@ export class CdpService extends EventEmitter {
         throw new Error(
             `Workbench page for workspace "${projectName}" not found within ${maxWaitMs / 1000} seconds`,
         );
+    }
+
+    private titleMatchesProject(title: string, projectName: string): boolean {
+        const normalizedProject = projectName.trim().toLowerCase();
+        if (!normalizedProject) return false;
+
+        return title
+            .split(/\s[—–-]\s/)
+            .map((part) => part.trim().toLowerCase())
+            .some((part) => part === normalizedProject);
     }
 
     private async runCommand(command: string, args: string[]): Promise<void> {
